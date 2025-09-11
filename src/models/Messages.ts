@@ -8,11 +8,28 @@ export interface IMessage extends Document {
     url: string;
     publicId: string;
   };
-  messageType: "text" | "image" | "deleted";
+  messageType: "text" | "image" | "deleted" | "reply" | "forward";
   seen: boolean;
   seenAt?: Date;
   createdAt: Date;
   updatedAt: Date;
+  reactions?: {
+    userId: string;
+    emoji: string;
+  }[];
+  replyTo?: Types.ObjectId;
+  forwardedFrom?: string;
+  // Fix the type for repliedMessage - it should only allow the basic message types
+  repliedMessage?: {
+    _id: Types.ObjectId;
+    text?: string;
+    sender: string;
+    messageType: "text" | "image" | "deleted"; // Only these three types
+    image?: {
+      url: string;
+      publicId: string;
+    };
+  };
 }
 
 const schema = new Schema<IMessage>(
@@ -24,7 +41,7 @@ const schema = new Schema<IMessage>(
     },
     sender: {
       type: String,
-      requred: true,
+      required: true,
     },
     text: String,
     image: {
@@ -33,7 +50,7 @@ const schema = new Schema<IMessage>(
     },
     messageType: {
       type: String,
-      enum: ["text", "image", "deleted"],
+      enum: ["text", "image", "deleted", "reply", "forward"],
       default: "text",
     },
     seen: {
@@ -43,6 +60,38 @@ const schema = new Schema<IMessage>(
     seenAt: {
       type: Date,
       default: null,
+    },
+    reactions: [
+      {
+        userId: String,
+        emoji: String,
+        _id: false,
+      },
+    ],
+    replyTo: {
+      type: Schema.Types.ObjectId,
+      ref: "Messages",
+      default: null,
+    },
+    forwardedFrom: {
+      type: String,
+      default: null,
+    },
+    repliedMessage: {
+      _id: {
+        type: Schema.Types.ObjectId,
+        ref: "Messages",
+      },
+      text: String,
+      sender: String,
+      messageType: {
+        type: String,
+        enum: ["text", "image", "deleted"], // Only these three types allowed
+      },
+      image: {
+        url: String,
+        publicId: String,
+      },
     },
   },
   {
