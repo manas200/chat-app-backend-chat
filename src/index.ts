@@ -11,7 +11,12 @@ connectDb();
 
 app.use(express.json());
 
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:3000", "https://the-pulse-chat-app.vercel.app"],
+    credentials: true,
+  })
+);
 
 app.use("/api/v1", chatRoutes);
 
