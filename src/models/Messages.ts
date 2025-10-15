@@ -19,12 +19,11 @@ export interface IMessage extends Document {
   }[];
   replyTo?: Types.ObjectId;
   forwardedFrom?: string;
-  // Fix the type for repliedMessage - it should only allow the basic message types
   repliedMessage?: {
     _id: Types.ObjectId;
     text?: string;
     sender: string;
-    messageType: "text" | "image" | "deleted"; // Only these three types
+    messageType: "text" | "image" | "deleted";
     image?: {
       url: string;
       publicId: string;
