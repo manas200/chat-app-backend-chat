@@ -1,5 +1,14 @@
 import mongoose, { Document, Schema, Types } from "mongoose";
 
+export interface ILinkPreview {
+  url: string;
+  title?: string;
+  description?: string;
+  image?: string;
+  siteName?: string;
+  favicon?: string;
+}
+
 export interface IMessage extends Document {
   chatId: Types.ObjectId;
   sender: string;
@@ -29,6 +38,9 @@ export interface IMessage extends Document {
       publicId: string;
     };
   };
+  isEdited?: boolean;
+  editedAt?: Date;
+  linkPreview?: ILinkPreview;
 }
 
 const schema = new Schema<IMessage>(
@@ -91,6 +103,22 @@ const schema = new Schema<IMessage>(
         url: String,
         publicId: String,
       },
+    },
+    isEdited: {
+      type: Boolean,
+      default: false,
+    },
+    editedAt: {
+      type: Date,
+      default: null,
+    },
+    linkPreview: {
+      url: String,
+      title: String,
+      description: String,
+      image: String,
+      siteName: String,
+      favicon: String,
     },
   },
   {

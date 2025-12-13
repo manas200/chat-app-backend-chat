@@ -8,6 +8,8 @@ import {
   addReaction,
   getMessageWithReplies,
   deleteMessage,
+  editMessage,
+  getLinkPreviewData,
 } from "../controllers/chat.js";
 import { upload } from "../middlewares/multer.js";
 
@@ -20,5 +22,7 @@ router.get("/message/:chatId", isAuth, getMessagesByChat);
 router.post("/message/reaction", isAuth, addReaction);
 router.get("/message/details/:messageId", isAuth, getMessageWithReplies);
 router.delete("/messages/:messageId", isAuth, deleteMessage);
+router.put("/messages/:messageId", isAuth, editMessage);
+router.get("/link-preview", isAuth, getLinkPreviewData);
 
 export default router;

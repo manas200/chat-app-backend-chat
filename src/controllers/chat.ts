@@ -1,9 +1,77 @@
 import axios from "axios";
+import { getLinkPreview } from "link-preview-js";
 import TryCatch from "../config/TryCatch.js";
 import { AuthenticatedRequest } from "../middlewares/isAuth.js";
 import { Chat } from "../models/Chat.js";
-import { Messages } from "../models/Messages.js";
+import { Messages, ILinkPreview } from "../models/Messages.js";
 import { getRecieverSocketId, io } from "../config/socket.js";
+
+// URL regex pattern for detecting links in text
+const URL_REGEX = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+)/gi;
+
+// Helper function to extract first URL from text
+const extractFirstUrl = (text: string): string | null => {
+  const matches = text.match(URL_REGEX);
+  return matches ? matches[0] : null;
+};
+
+// Helper function to fetch link preview data
+const fetchLinkPreview = async (url: string): Promise<ILinkPreview | null> => {
+  try {
+    const data = await getLinkPreview(url, {
+      timeout: 5000,
+      headers: {
+        "user-agent":
+          "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)",
+      },
+      followRedirects: "follow",
+    });
+
+    // Handle different response types
+    if ("title" in data) {
+      return {
+        url: data.url,
+        title: data.title || undefined,
+        description: data.description || undefined,
+        image: data.images?.[0] || undefined,
+        siteName: data.siteName || undefined,
+        favicon: data.favicons?.[0] || undefined,
+      };
+    }
+
+    // For media types (images, videos, etc.)
+    return {
+      url: data.url,
+      title: data.mediaType || "Link",
+    };
+  } catch (error) {
+    console.log("Failed to fetch link preview:", error);
+    return null;
+  }
+};
+
+// Endpoint to fetch link preview (for real-time preview while typing)
+export const getLinkPreviewData = TryCatch(
+  async (req: AuthenticatedRequest, res) => {
+    const { url } = req.query;
+
+    if (!url || typeof url !== "string") {
+      return res.status(400).json({
+        message: "URL is required",
+      });
+    }
+
+    const preview = await fetchLinkPreview(url);
+
+    if (!preview) {
+      return res.status(404).json({
+        message: "Could not fetch preview for this URL",
+      });
+    }
+
+    res.json({ preview });
+  }
+);
 
 export const createNewChat = TryCatch(
   async (req: AuthenticatedRequest, res) => {
@@ -277,6 +345,17 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     messageData.messageType = replyTo ? "reply" : "text";
   }
 
+  // Extract and fetch link preview for text messages
+  if (text && !imageFile) {
+    const firstUrl = extractFirstUrl(text);
+    if (firstUrl) {
+      const linkPreview = await fetchLinkPreview(firstUrl);
+      if (linkPreview) {
+        messageData.linkPreview = linkPreview;
+      }
+    }
+  }
+
   const message = new Messages(messageData);
   const savedMessage = await message.save();
 
@@ -466,9 +545,85 @@ export const getMessagesByChat = TryCatch(
   }
 );
 
-export const deleteMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
+export const deleteMessage = TryCatch(
+  async (req: AuthenticatedRequest, res) => {
+    const userId = req.user?._id;
+    const { messageId } = req.params;
+
+    if (!userId) {
+      return res.status(401).json({
+        message: "Unauthorized",
+      });
+    }
+
+    if (!messageId) {
+      return res.status(400).json({
+        message: "Message ID is required",
+      });
+    }
+
+    const message = await Messages.findById(messageId);
+    if (!message) {
+      return res.status(404).json({
+        message: "Message not found",
+      });
+    }
+
+    // Check if user is the sender of the message
+    if (message.sender.toString() !== userId.toString()) {
+      return res.status(403).json({
+        message: "You can only delete your own messages",
+      });
+    }
+
+    // Update message to deleted state instead of removing it
+    message.messageType = "deleted";
+    message.text = "";
+    message.image = undefined;
+    message.reactions = []; // Clear all reactions when message is deleted
+    await message.save();
+
+    // Emit socket event
+    const chatId = message.chatId.toString();
+    const deletedMessageData = {
+      messageId: message._id,
+      chatId,
+      _id: message._id,
+      messageType: "deleted",
+      text: "",
+      image: undefined,
+      sender: message.sender,
+      createdAt: message.createdAt,
+      updatedAt: message.updatedAt,
+      reactions: [], // Always empty for deleted messages
+      seen: message.seen,
+      seenAt: message.seenAt,
+    };
+
+    console.log("📤 Emitting messageDeleted event:", deletedMessageData);
+    io.to(chatId).emit("messageDeleted", deletedMessageData);
+
+    // Update chat's latest message if this was the latest message
+    const chat = await Chat.findById(chatId);
+    if (chat && chat.latestMessage.text !== "Message deleted") {
+      await Chat.findByIdAndUpdate(chatId, {
+        latestMessage: {
+          text: "Message deleted",
+          sender: userId,
+        },
+      });
+    }
+
+    res.json({
+      message: "Message deleted successfully",
+    });
+  }
+);
+
+export const editMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
   const userId = req.user?._id;
   const { messageId } = req.params;
+  const { text } = req.body;
 
   if (!userId) {
     return res.status(401).json({
@@ -482,6 +637,12 @@ export const deleteMessage = TryCatch(async (req: AuthenticatedRequest, res) => 
     });
   }
 
+  if (!text || !text.trim()) {
+    return res.status(400).json({
+      message: "Message text is required",
+    });
+  }
+
   const message = await Messages.findById(messageId);
   if (!message) {
     return res.status(404).json({
@@ -492,49 +653,92 @@ export const deleteMessage = TryCatch(async (req: AuthenticatedRequest, res) => 
   // Check if user is the sender of the message
   if (message.sender.toString() !== userId.toString()) {
     return res.status(403).json({
-      message: "You can only delete your own messages",
+      message: "You can only edit your own messages",
     });
   }
 
-  // Update message to deleted state instead of removing it
-  message.messageType = "deleted";
-  message.text = "";
-  message.image = undefined;
-  message.reactions = []; // Clear all reactions when message is deleted
+  // Check if message is deleted
+  if (message.messageType === "deleted") {
+    return res.status(400).json({
+      message: "Cannot edit a deleted message",
+    });
+  }
+
+  // Check if message has an image (image-only messages cannot be edited to text-only)
+  if (message.messageType === "image" && !message.text) {
+    return res.status(400).json({
+      message: "Cannot edit image-only messages",
+    });
+  }
+
+  // Check if message is within 15 minutes edit window
+  const messageCreatedAt = new Date(message.createdAt).getTime();
+  const currentTime = Date.now();
+  const fifteenMinutesInMs = 15 * 60 * 1000; // 15 minutes in milliseconds
+
+  if (currentTime - messageCreatedAt > fifteenMinutesInMs) {
+    return res.status(400).json({
+      message: "Messages can only be edited within 15 minutes of sending",
+    });
+  }
+
+  // Update the message
+  message.text = text.trim();
+  message.isEdited = true;
+  message.editedAt = new Date();
   await message.save();
 
-  // Emit socket event
+  // Emit socket event to notify all users in the chat
   const chatId = message.chatId.toString();
-  const deletedMessageData = {
+  const editedMessageData = {
     messageId: message._id,
     chatId,
     _id: message._id,
-    messageType: "deleted",
-    text: "",
-    image: undefined,
+    text: message.text,
+    isEdited: true,
+    editedAt: message.editedAt,
+    messageType: message.messageType,
     sender: message.sender,
     createdAt: message.createdAt,
     updatedAt: message.updatedAt,
-    reactions: [], // Always empty for deleted messages
+    reactions: message.reactions,
     seen: message.seen,
     seenAt: message.seenAt,
+    image: message.image,
+    replyTo: message.replyTo,
+    repliedMessage: message.repliedMessage,
   };
-  
-  console.log("📤 Emitting messageDeleted event:", deletedMessageData);
-  io.to(chatId).emit("messageDeleted", deletedMessageData);
+
+  console.log("📝 Emitting messageEdited event:", editedMessageData);
+  io.to(chatId).emit("messageEdited", editedMessageData);
+
+  // Also emit to individual user sockets to ensure delivery
+  const chat = await Chat.findById(chatId);
+  if (chat) {
+    chat.users.forEach((chatUserId) => {
+      const userSocketId = getRecieverSocketId(chatUserId);
+      if (userSocketId) {
+        io.to(userSocketId).emit("messageEdited", editedMessageData);
+      }
+    });
+  }
 
   // Update chat's latest message if this was the latest message
-  const chat = await Chat.findById(chatId);
-  if (chat && chat.latestMessage.text !== "Message deleted") {
+  const latestMessage = await Messages.findOne({ chatId })
+    .sort({ createdAt: -1 })
+    .limit(1);
+
+  if (latestMessage && (latestMessage._id as any).toString() === messageId) {
     await Chat.findByIdAndUpdate(chatId, {
       latestMessage: {
-        text: "Message deleted",
+        text: message.text,
         sender: userId,
       },
     });
   }
 
   res.json({
-    message: "Message deleted successfully",
+    message: "Message edited successfully",
+    editedMessage: editedMessageData,
   });
 });
