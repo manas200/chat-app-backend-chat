@@ -10,6 +10,7 @@ import {
   deleteMessage,
   editMessage,
   getLinkPreviewData,
+  getCacheStatus,
 } from "../controllers/chat.js";
 import { upload } from "../middlewares/multer.js";
 
@@ -24,5 +25,6 @@ router.get("/message/details/:messageId", isAuth, getMessageWithReplies);
 router.delete("/messages/:messageId", isAuth, deleteMessage);
 router.put("/messages/:messageId", isAuth, editMessage);
 router.get("/link-preview", isAuth, getLinkPreviewData);
+router.get("/cache-status", isAuth, getCacheStatus); // Debug endpoint
 
 export default router;

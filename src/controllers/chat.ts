@@ -5,6 +5,10 @@ import { AuthenticatedRequest } from "../middlewares/isAuth.js";
 import { Chat } from "../models/Chat.js";
 import { Messages, ILinkPreview } from "../models/Messages.js";
 import { getRecieverSocketId, io } from "../config/socket.js";
+import { cacheService } from "../services/CacheService.js";
+
+// User service URL with fallback for local development
+const USER_SERVICE_URL = process.env.USER_SERVICE || "http://localhost:5000";
 
 // URL regex pattern for detecting links in text
 const URL_REGEX = /(https?:\/\/[^\s<>"{}|\\^`\[\]]+)/gi;
@@ -101,6 +105,12 @@ export const createNewChat = TryCatch(
       users: [userId, otherUserId],
     });
 
+    // Invalidate cache for both users
+    await cacheService.invalidate(
+      cacheService.getChatsCacheKey(userId as string)
+    );
+    await cacheService.invalidate(cacheService.getChatsCacheKey(otherUserId));
+
     res.status(201).json({
       message: "New Chat created",
       chatId: newChat._id,
@@ -117,44 +127,129 @@ export const getAllChats = TryCatch(async (req: AuthenticatedRequest, res) => {
     return;
   }
 
-  const chats = await Chat.find({ users: userId }).sort({ updatedAt: -1 });
+  // Try to get cached chat data (user info for each chat)
+  const cacheKey = cacheService.getChatsCacheKey(userId);
+  const cachedData = await cacheService.get<
+    {
+      chatId: string;
+      otherUserId: string;
+      user: {
+        _id: string;
+        name: string;
+        email?: string;
+        profilePic?: { url?: string };
+      };
+      chat: object;
+    }[]
+  >(cacheKey);
 
-  const chatWithUserData = await Promise.all(
-    chats.map(async (chat) => {
-      const otherUserId = chat.users.find((id) => id !== userId);
+  let chatWithUserData;
 
-      const unseenCount = await Messages.countDocuments({
-        chatId: chat._id,
-        sender: { $ne: userId },
-        seen: false,
-      });
+  if (cachedData) {
+    // Cache HIT - We have cached user data, but need fresh unseen counts
+    console.log(`📦 Cache HIT for user ${userId} chats`);
 
-      try {
-        const { data } = await axios.get(
-          `${process.env.USER_SERVICE}/api/v1/user/${otherUserId}`
-        );
+    chatWithUserData = await Promise.all(
+      cachedData.map(async (item) => {
+        // Get fresh unseen count
+        const unseenCount = await Messages.countDocuments({
+          chatId: item.chatId,
+          sender: { $ne: userId },
+          seen: false,
+        });
+
+        // Get fresh chat data (for latestMessage updates)
+        const freshChat = await Chat.findById(item.chatId);
 
         return {
-          user: data,
+          user: item.user,
           chat: {
-            ...chat.toObject(),
-            latestMessage: chat.latestMessage || null,
+            ...(freshChat ? freshChat.toObject() : item.chat),
+            latestMessage: freshChat?.latestMessage || null,
             unseenCount,
           },
         };
-      } catch (error) {
-        console.log(error);
-        return {
-          user: { _id: otherUserId, name: "Unknown User" },
-          chat: {
-            ...chat.toObject(),
-            latestMessage: chat.latestMessage || null,
-            unseenCount,
-          },
-        };
-      }
-    })
-  );
+      })
+    );
+  } else {
+    // Cache MISS - Fetch everything fresh
+    console.log(`🔍 Cache MISS for user ${userId} chats - fetching from DB`);
+
+    const chats = await Chat.find({ users: userId }).sort({ updatedAt: -1 });
+
+    const dataToCache: {
+      chatId: string;
+      otherUserId: string;
+      user: {
+        _id: string;
+        name: string;
+        email?: string;
+        profilePic?: { url?: string };
+      };
+      chat: object;
+    }[] = [];
+
+    chatWithUserData = await Promise.all(
+      chats.map(async (chat) => {
+        const otherUserId = chat.users.find((id) => id !== userId);
+
+        const unseenCount = await Messages.countDocuments({
+          chatId: chat._id,
+          sender: { $ne: userId },
+          seen: false,
+        });
+
+        try {
+          const { data } = await axios.get(
+            `${USER_SERVICE_URL}/api/v1/user/${otherUserId}`
+          );
+
+          // Store for caching (user data is expensive to fetch)
+          dataToCache.push({
+            chatId: String(chat._id),
+            otherUserId: otherUserId as string,
+            user: data,
+            chat: chat.toObject(),
+          });
+
+          return {
+            user: data,
+            chat: {
+              ...chat.toObject(),
+              latestMessage: chat.latestMessage || null,
+              unseenCount,
+            },
+          };
+        } catch (error) {
+          console.log(error);
+          const fallbackUser = {
+            _id: otherUserId as string,
+            name: "Unknown User",
+          };
+
+          dataToCache.push({
+            chatId: String(chat._id),
+            otherUserId: otherUserId as string,
+            user: fallbackUser,
+            chat: chat.toObject(),
+          });
+
+          return {
+            user: fallbackUser,
+            chat: {
+              ...chat.toObject(),
+              latestMessage: chat.latestMessage || null,
+              unseenCount,
+            },
+          };
+        }
+      })
+    );
+
+    // Cache the data for 5 minutes (300 seconds) - user data doesn't change often
+    await cacheService.set(cacheKey, dataToCache, 300);
+    console.log(`💾 Cached chat data for user ${userId}`);
+  }
 
   res.json({
     chats: chatWithUserData,
@@ -283,6 +378,34 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     return;
   }
 
+  // Fetch privacy settings for both users to check read receipts
+  let senderPrivacy = { showReadReceipts: true };
+  let receiverPrivacy = { showReadReceipts: true };
+
+  try {
+    const { data: senderData } = await axios.get(
+      `${USER_SERVICE_URL}/api/v1/user/${senderId}/public`
+    );
+    senderPrivacy = senderData.privacySettings || { showReadReceipts: true };
+  } catch (error) {
+    console.log("Could not fetch sender privacy settings");
+  }
+
+  try {
+    const { data: receiverData } = await axios.get(
+      `${USER_SERVICE_URL}/api/v1/user/${otherUserId}/public`
+    );
+    receiverPrivacy = receiverData.privacySettings || {
+      showReadReceipts: true,
+    };
+  } catch (error) {
+    console.log("Could not fetch receiver privacy settings");
+  }
+
+  // Both users must have read receipts enabled for seenAt to be set
+  const bothAllowReadReceipts =
+    senderPrivacy.showReadReceipts && receiverPrivacy.showReadReceipts;
+
   // Socket setup
   const receiverSocketId = getRecieverSocketId(otherUserId.toString());
   let isReceiverInChatRoom = false;
@@ -298,7 +421,9 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     chatId: chatId,
     sender: senderId,
     seen: isReceiverInChatRoom,
-    seenAt: isReceiverInChatRoom ? new Date() : undefined,
+    // Only set seenAt if BOTH users have read receipts enabled
+    seenAt:
+      isReceiverInChatRoom && bothAllowReadReceipts ? new Date() : undefined,
   };
 
   // Handle reply
@@ -385,6 +510,12 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     { new: true }
   );
 
+  // Invalidate cache for both users so they see the updated chat list
+  await cacheService.invalidate(cacheService.getChatsCacheKey(senderId));
+  await cacheService.invalidate(
+    cacheService.getChatsCacheKey(otherUserId.toString())
+  );
+
   // Emit to sockets
   io.to(chatId).emit("newMessage", finalMessage);
 
@@ -397,11 +528,13 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     io.to(senderSocketId).emit("newMessage", finalMessage);
   }
 
-  if (isReceiverInChatRoom && senderSocketId) {
+  // Only emit messagesSeen if BOTH users have read receipts enabled
+  if (isReceiverInChatRoom && senderSocketId && bothAllowReadReceipts) {
     io.to(senderSocketId).emit("messagesSeen", {
       chatId: chatId,
       seenBy: otherUserId,
       messageIds: [finalMessage._id],
+      seenAt: new Date(),
     });
   }
 
@@ -415,6 +548,11 @@ export const getMessagesByChat = TryCatch(
   async (req: AuthenticatedRequest, res) => {
     const userId = req.user?._id;
     const { chatId } = req.params;
+
+    // Pagination params - default to last 50 messages
+    const page = parseInt(req.query.page as string) || 1;
+    const limit = parseInt(req.query.limit as string) || 50;
+    const skip = (page - 1) * limit;
 
     if (!userId) {
       res.status(401).json({
@@ -447,37 +585,100 @@ export const getMessagesByChat = TryCatch(
       return;
     }
 
-    // Mark messages as seen
-    const messagesToMarkSeen = await Messages.find({
-      chatId: chatId,
-      sender: { $ne: userId },
-      seen: false,
-    });
+    // Get other user to check their privacy settings
+    const otherUserId = chat.users.find(
+      (id) => id.toString() !== userId.toString()
+    );
 
-    if (messagesToMarkSeen.length > 0) {
-      await Messages.updateMany(
-        {
-          chatId: chatId,
-          sender: { $ne: userId },
-          seen: false,
-        },
-        {
-          seen: true,
-          seenAt: new Date(),
-        }
+    // Fetch current user's privacy settings to check if they allow read receipts
+    let currentUserPrivacy = { showReadReceipts: true };
+    let otherUserPrivacy = { showReadReceipts: true };
+
+    try {
+      const { data: currentUserData } = await axios.get(
+        `${USER_SERVICE_URL}/api/v1/user/${userId}/public`
       );
+      currentUserPrivacy = currentUserData.privacySettings || {
+        showReadReceipts: true,
+      };
+    } catch (error) {
+      console.log("Could not fetch current user privacy settings");
     }
 
-    // Get messages with proper population
+    if (otherUserId) {
+      try {
+        const { data: otherUserData } = await axios.get(
+          `${USER_SERVICE_URL}/api/v1/user/${otherUserId}/public`
+        );
+        otherUserPrivacy = otherUserData.privacySettings || {
+          showReadReceipts: true,
+        };
+      } catch (error) {
+        console.log("Could not fetch other user privacy settings");
+      }
+    }
+    // Mark messages as seen (only for first page / initial load)
+    // Only update seenAt if BOTH users have read receipts enabled
+    const bothAllowReadReceipts =
+      currentUserPrivacy.showReadReceipts && otherUserPrivacy.showReadReceipts;
+
+    if (page === 1) {
+      const messagesToMarkSeen = await Messages.find({
+        chatId: chatId,
+        sender: { $ne: userId },
+        seen: false,
+      });
+
+      if (messagesToMarkSeen.length > 0) {
+        // Always mark as seen internally, but only set seenAt if both allow read receipts
+        await Messages.updateMany(
+          {
+            chatId: chatId,
+            sender: { $ne: userId },
+            seen: false,
+          },
+          {
+            seen: true,
+            ...(bothAllowReadReceipts ? { seenAt: new Date() } : {}),
+          }
+        );
+
+        // Only emit messagesSeen event if BOTH users have read receipts enabled
+        if (bothAllowReadReceipts && otherUserId) {
+          const otherUserSocketId = getRecieverSocketId(otherUserId.toString());
+          if (otherUserSocketId) {
+            io.to(otherUserSocketId).emit("messagesSeen", {
+              chatId: chatId,
+              seenBy: userId,
+              messageIds: messagesToMarkSeen.map((msg) => msg._id),
+              seenAt: new Date(),
+            });
+          }
+        }
+      }
+    }
+
+    // Get total count for pagination info
+    const totalMessages = await Messages.countDocuments({ chatId });
+    const totalPages = Math.ceil(totalMessages / limit);
+    const hasMore = page < totalPages;
+
+    // Get messages with pagination (newest first for loading, then reverse for display)
+    // We sort by createdAt: -1 to get newest first, skip older ones, then reverse
     const messages = await Messages.find({ chatId })
       .populate({
         path: "replyTo",
         select: "text sender messageType image",
       })
-      .sort({ createdAt: 1 });
+      .sort({ createdAt: -1 }) // Newest first
+      .skip(skip)
+      .limit(limit);
+
+    // Reverse to get chronological order for display
+    const chronologicalMessages = messages.reverse();
 
     // Convert to plain objects and ensure proper types
-    const formattedMessages = messages.map((msg) => {
+    const formattedMessages = chronologicalMessages.map((msg) => {
       const messageObj = msg.toObject();
 
       // Ensure repliedMessage has correct structure if it exists
@@ -504,44 +705,42 @@ export const getMessagesByChat = TryCatch(
       return messageObj;
     });
 
-    const otherUserId = chat.users.find(
-      (id) => id.toString() !== userId.toString()
-    );
+    // Fetch user data - don't cache lastSeen since it changes frequently
+    // Note: otherUserId is already defined above
+    let userData;
+    if (otherUserId) {
+      try {
+        // Use the public profile endpoint which is privacy-aware
+        const fullUrl = `${USER_SERVICE_URL}/api/v1/user/${otherUserId}/public`;
+        console.log(`🌐 Fetching user from: ${fullUrl}`);
 
-    // Socket notification for seen messages
-    if (messagesToMarkSeen.length > 0 && otherUserId) {
-      const otherUserSocketId = getRecieverSocketId(otherUserId.toString());
-      if (otherUserSocketId) {
-        io.to(otherUserSocketId).emit("messagesSeen", {
-          chatId: chatId,
-          seenBy: userId,
-          messageIds: messagesToMarkSeen.map((msg) => msg._id),
-        });
-      }
-    }
-
-    try {
-      let userData;
-      if (otherUserId) {
-        const { data } = await axios.get(
-          `${process.env.USER_SERVICE}/api/v1/user/${otherUserId}`
-        );
+        const { data } = await axios.get(fullUrl);
         userData = data;
-      } else {
+        console.log(`🔍 Fetched user data for ${otherUserId}:`, {
+          name: data.name,
+          lastSeen: data.lastSeen,
+          showLastSeen: data.privacySettings?.showLastSeen,
+        });
+      } catch (error: any) {
+        console.log("❌ Error fetching user:", error.message);
+        console.log("❌ Error details:", error.response?.data || error.code);
         userData = { _id: otherUserId, name: "Unknown User" };
       }
-
-      res.json({
-        messages: formattedMessages,
-        user: userData,
-      });
-    } catch (error) {
-      console.log(error);
-      res.json({
-        messages: formattedMessages,
-        user: { _id: otherUserId, name: "Unknown User" },
-      });
+    } else {
+      userData = { _id: otherUserId, name: "Unknown User" };
     }
+
+    res.json({
+      messages: formattedMessages,
+      user: userData,
+      pagination: {
+        page,
+        limit,
+        totalMessages,
+        totalPages,
+        hasMore,
+      },
+    });
   }
 );
 
@@ -612,6 +811,13 @@ export const deleteMessage = TryCatch(
           sender: userId,
         },
       });
+
+      // Invalidate cache for both users
+      for (const participantId of chat.users) {
+        await cacheService.invalidate(
+          cacheService.getChatsCacheKey(participantId)
+        );
+      }
     }
 
     res.json({
@@ -735,6 +941,15 @@ export const editMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
         sender: userId,
       },
     });
+
+    // Invalidate cache for both users if latest message was edited
+    if (chat) {
+      for (const participantId of chat.users) {
+        await cacheService.invalidate(
+          cacheService.getChatsCacheKey(participantId)
+        );
+      }
+    }
   }
 
   res.json({
@@ -742,3 +957,25 @@ export const editMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     editedMessage: editedMessageData,
   });
 });
+
+// Debug endpoint to check cache status (remove in production)
+export const getCacheStatus = TryCatch(
+  async (req: AuthenticatedRequest, res) => {
+    const userId = req.user?._id;
+    if (!userId) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const cacheKey = cacheService.getChatsCacheKey(userId);
+    const cachedData = await cacheService.get(cacheKey);
+
+    res.json({
+      cacheKey,
+      isCached: !!cachedData,
+      cachedItemsCount: cachedData ? (cachedData as unknown[]).length : 0,
+      message: cachedData
+        ? "✅ Cache HIT - Data is cached"
+        : "❌ Cache MISS - No cached data",
+    });
+  }
+);
