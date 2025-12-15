@@ -378,28 +378,27 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     return;
   }
 
-  // Fetch privacy settings for both users to check read receipts
+  // Fetch privacy settings for both users to check read receipts (in parallel)
+  const [senderPrivacyResult, receiverPrivacyResult] = await Promise.allSettled(
+    [
+      axios.get(`${USER_SERVICE_URL}/api/v1/user/${senderId}/public`),
+      axios.get(`${USER_SERVICE_URL}/api/v1/user/${otherUserId}/public`),
+    ]
+  );
+
   let senderPrivacy = { showReadReceipts: true };
   let receiverPrivacy = { showReadReceipts: true };
 
-  try {
-    const { data: senderData } = await axios.get(
-      `${USER_SERVICE_URL}/api/v1/user/${senderId}/public`
-    );
-    senderPrivacy = senderData.privacySettings || { showReadReceipts: true };
-  } catch (error) {
-    console.log("Could not fetch sender privacy settings");
-  }
-
-  try {
-    const { data: receiverData } = await axios.get(
-      `${USER_SERVICE_URL}/api/v1/user/${otherUserId}/public`
-    );
-    receiverPrivacy = receiverData.privacySettings || {
+  if (senderPrivacyResult.status === "fulfilled") {
+    senderPrivacy = senderPrivacyResult.value.data.privacySettings || {
       showReadReceipts: true,
     };
-  } catch (error) {
-    console.log("Could not fetch receiver privacy settings");
+  }
+
+  if (receiverPrivacyResult.status === "fulfilled") {
+    receiverPrivacy = receiverPrivacyResult.value.data.privacySettings || {
+      showReadReceipts: true,
+    };
   }
 
   // Both users must have read receipts enabled for seenAt to be set
@@ -470,17 +469,7 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     messageData.messageType = replyTo ? "reply" : "text";
   }
 
-  // Extract and fetch link preview for text messages
-  if (text && !imageFile) {
-    const firstUrl = extractFirstUrl(text);
-    if (firstUrl) {
-      const linkPreview = await fetchLinkPreview(firstUrl);
-      if (linkPreview) {
-        messageData.linkPreview = linkPreview;
-      }
-    }
-  }
-
+  // Save message immediately for fast response
   const message = new Messages(messageData);
   const savedMessage = await message.save();
 
@@ -491,6 +480,40 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
       message: "Failed to save message",
     });
     return;
+  }
+
+  // Fetch link preview AFTER saving and responding (non-blocking)
+  if (text && !imageFile) {
+    const firstUrl = extractFirstUrl(text);
+    if (firstUrl) {
+      // Don't await - fetch in background
+      fetchLinkPreview(firstUrl)
+        .then(async (linkPreview) => {
+          if (linkPreview) {
+            // Update message with link preview asynchronously
+            const updatedMessage = await Messages.findByIdAndUpdate(
+              savedMessage._id,
+              { $set: { linkPreview: linkPreview } },
+              { new: true }
+            );
+
+            // Emit updated message with preview to both users
+            if (updatedMessage) {
+              io.to(chatId).emit("messageUpdated", updatedMessage);
+              if (receiverSocketId) {
+                io.to(receiverSocketId).emit("messageUpdated", updatedMessage);
+              }
+              const senderSocketId = getRecieverSocketId(senderId.toString());
+              if (senderSocketId) {
+                io.to(senderSocketId).emit("messageUpdated", updatedMessage);
+              }
+            }
+          }
+        })
+        .catch((err) => {
+          console.log("Link preview fetch failed (non-critical):", err.message);
+        });
+    }
   }
 
   let latestMessageText = imageFile ? "📷 Image" : text;
@@ -510,13 +533,17 @@ export const sendMessage = TryCatch(async (req: AuthenticatedRequest, res) => {
     { new: true }
   );
 
-  // Invalidate cache for both users so they see the updated chat list
-  await cacheService.invalidate(cacheService.getChatsCacheKey(senderId));
-  await cacheService.invalidate(
-    cacheService.getChatsCacheKey(otherUserId.toString())
+  // Invalidate cache in background (non-blocking)
+  Promise.all([
+    cacheService.invalidate(cacheService.getChatsCacheKey(senderId)),
+    cacheService.invalidate(
+      cacheService.getChatsCacheKey(otherUserId.toString())
+    ),
+  ]).catch((err) =>
+    console.log("Cache invalidation error (non-critical):", err.message)
   );
 
-  // Emit to sockets
+  // Emit to sockets immediately
   io.to(chatId).emit("newMessage", finalMessage);
 
   if (receiverSocketId) {
